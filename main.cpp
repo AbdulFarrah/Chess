@@ -22,6 +22,10 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <regex>
+#include <charconv>
+#include <poll.h>
+#include <csignal>
+#include <sys/ioctl.h>
 
 static const char *kEnginePath = "/usr/games/stockfish";
 static const char *kGoCommand = "go movetime 1000";
@@ -30,12 +34,14 @@ void debugLog(const std::string &msg, bool firstRun = false)
 {
 	static bool fileCleared = false;
 	const std::string logFile = "chess_debug.log";
+	static std::ofstream log;
 	if (!fileCleared && firstRun)
 	{
+		if (log.is_open()) log.close();
 		std::remove(logFile.c_str());
 		fileCleared = true;
 	}
-	std::ofstream log(logFile, std::ios::app);
+	if (!log.is_open()) log.open(logFile, std::ios::app);
 	if (log.is_open())
 	{
 		log << msg << "\n";
@@ -107,25 +113,49 @@ static std::optional<chess::Move> uci_to_move_on_board(const std::string &uci, c
 	return std::nullopt;
 }
 
-static void uci_write(int fd, const std::string &s)
+static bool uci_write(int fd, const std::string &s)
 {
 	std::string line = s;
 	if (line.empty() || line.back() != '\n')
 		line.push_back('\n');
-	ssize_t wrote = ::write(fd, line.data(), line.size());
-	(void)wrote;
-	// debugLog("uci_write called: fd= " + std::to_string(fd) + " original= \"" + s + "\"" + " final= \"" + line + "bytes_written= " + std::to_string(wrote));
+	size_t offset = 0;
+	while (offset < line.size())
+	{
+		ssize_t wrote = ::write(fd, line.data() + offset, line.size() - offset);
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return false;
+		offset += static_cast<size_t>(wrote);
+	}
+	return true;
 }
 
 static std::optional<std::string> uci_read_until(int fd, const std::string &starts_with, int timeout_ms = 5000)
 {
-	auto start = std::chrono::steady_clock::now();
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	std::string acc;
 	char buf[512];
 	// debugLog("uci_read_until called: fd=" + std::to_string(fd) + " starts_with=\"" + starts_with + "\"" + " timeout_ms=" + std::to_string(timeout_ms));
 	while (true)
 	{
-		ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+		auto now = std::chrono::steady_clock::now();
+		int remaining = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+		if (remaining <= 0)
+			return std::nullopt;
+		pollfd descriptor{fd, POLLIN, 0};
+		int ready;
+		do
+		{
+			ready = ::poll(&descriptor, 1, remaining);
+		} while (ready < 0 && errno == EINTR);
+		if (ready <= 0 || (descriptor.revents & (POLLERR | POLLNVAL)))
+			return std::nullopt;
+		ssize_t n;
+		do
+		{
+			n = ::read(fd, buf, sizeof(buf) - 1);
+		} while (n < 0 && errno == EINTR);
 		if (n <= 0)
 		{
 			debugLog("uci_read_until: read() returned " + std::to_string(n) + " -> EOF or error");
@@ -151,24 +181,59 @@ static std::optional<std::string> uci_read_until(int fd, const std::string &star
 				return line;
 			}
 		}
-		auto now = std::chrono::steady_clock::now();
-		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() > timeout_ms)
-		{
-			debugLog("uci_read_until: timeout (" + std::to_string(timeout_ms) +
-					 "ms) while waiting for \"" + starts_with + "\"");
-			return std::nullopt;
-		}
 	}
+}
+
+static void stopEngine(pid_t pid, int child_in, int child_out)
+{
+	if (child_in >= 0)
+	{
+		uci_write(child_in, "quit");
+		close(child_in);
+	}
+	if (child_out >= 0)
+		close(child_out);
+	if (pid <= 0)
+		return;
+	auto waitBriefly = [pid](int milliseconds)
+	{
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+		while (std::chrono::steady_clock::now() < deadline)
+		{
+			pid_t result = waitpid(pid, nullptr, WNOHANG);
+			if (result == pid || (result < 0 && errno == ECHILD))
+				return true;
+			if (result < 0 && errno != EINTR)
+				return true;
+			usleep(10000);
+		}
+		return false;
+	};
+	if (waitBriefly(500))
+		return;
+	kill(pid, SIGTERM);
+	if (waitBriefly(500))
+		return;
+	kill(pid, SIGKILL);
+	if (!waitBriefly(1000))
+		debugLog("UCI: engine did not reap within timeout after SIGKILL");
 }
 
 chess::Move get_best_move_from_stockfish(const chess::Board &board)
 {
 	// debugLog("UCI: starting engine", true);
-	int to_child[2];
-	int from_child[2];
-	if (pipe(to_child) < 0 || pipe(from_child) < 0)
+	int to_child[2] = {-1, -1};
+	int from_child[2] = {-1, -1};
+	if (pipe(to_child) < 0)
 	{
-		debugLog("UCI: pipe() failed");
+		debugLog("UCI: input pipe() failed");
+		return chess::Move(chess::Move::NO_MOVE);
+	}
+	if (pipe(from_child) < 0)
+	{
+		debugLog("UCI: output pipe() failed");
+		close(to_child[0]);
+		close(to_child[1]);
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	// debugLog("UCI: pipes created successfully");
@@ -185,16 +250,16 @@ chess::Move get_best_move_from_stockfish(const chess::Board &board)
 	if (pid == 0)
 	{
 		// debugLog("UCI: in child process, setting up redirection before execlp()");
-		dup2(to_child[0], STDIN_FILENO);
-		dup2(from_child[1], STDOUT_FILENO);
-		dup2(from_child[1], STDERR_FILENO);
+		if (dup2(to_child[0], STDIN_FILENO) < 0 ||
+			dup2(from_child[1], STDOUT_FILENO) < 0 ||
+			dup2(from_child[1], STDERR_FILENO) < 0)
+			_exit(126);
 		close(to_child[1]);
 		close(from_child[0]);
 		close(to_child[0]);
 		close(from_child[1]);
 		// debugLog("UCI: execlp -> " + std::string(kEnginePath));
 		execlp(kEnginePath, kEnginePath, (char *)nullptr);
-		debugLog("UCI: execlp failed, exiting child with 127");
 		_exit(127);
 	}
 	// debugLog("UCI: in parent process, child pid = " + std::to_string(pid));
@@ -203,45 +268,69 @@ chess::Move get_best_move_from_stockfish(const chess::Board &board)
 	int child_in = to_child[1];
 	int child_out = from_child[0];
 	// debugLog("UCI: parent connected to child (child_in=" + std::to_string(child_in) + ", child_out=" + std::to_string(child_out) + ")");
-	uci_write(child_in, "uci");
+	if (!uci_write(child_in, "uci"))
+	{
+		debugLog("UCI: failed to send startup command");
+		stopEngine(pid, child_in, child_out);
+		return chess::Move(chess::Move::NO_MOVE);
+	}
 	// debugLog("UCI: sent 'uci' command");
 	if (!uci_read_until(child_out, "uciok"))
 	{
 		debugLog("UCI: no uciok (engine did not respond to 'uci')");
-		uci_write(child_in, "quit");
-		close(child_in);
-		close(child_out);
-		waitpid(pid, nullptr, 0);
+		stopEngine(pid, child_in, child_out);
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	// debugLog("UCI: got uciok");
-	uci_write(child_in, "isready");
+	if (!uci_write(child_in, "isready"))
+	{
+		debugLog("UCI: failed to send readiness command");
+		stopEngine(pid, child_in, child_out);
+		return chess::Move(chess::Move::NO_MOVE);
+	}
 	// debugLog("UCI: sent 'isready'");
 	if (!uci_read_until(child_out, "readyok"))
 	{
 		debugLog("UCI: no readyok (engine not ready)");
-		uci_write(child_in, "quit");
-		close(child_in);
-		close(child_out);
-		waitpid(pid, nullptr, 0);
+		stopEngine(pid, child_in, child_out);
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	// debugLog("UCI: got readyok");
 	std::string fen = board.getFen();
 	debugLog("UCI: sending position fen: " + fen);
-	uci_write(child_in, "position fen " + fen);
+	if (!uci_write(child_in, "position fen " + fen) || !uci_write(child_in, kGoCommand))
+	{
+		debugLog("UCI: failed to send position or search command");
+		stopEngine(pid, child_in, child_out);
+		return chess::Move(chess::Move::NO_MOVE);
+	}
 	// debugLog("UCI: sending go command: " + std::string(kGoCommand));
-	uci_write(child_in, kGoCommand);
 	std::optional<std::string> bestLine;
 	// debugLog("UCI: waiting for bestmove...");
 	{
-		auto start = std::chrono::steady_clock::now();
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
 		std::string acc;
 		char buf[512];
 		// debugLog("UCI: entering bestmove read loop...");
 		while (true)
 		{
-			ssize_t n = ::read(child_out, buf, sizeof(buf) - 1);
+			auto now = std::chrono::steady_clock::now();
+			int remaining = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+			if (remaining <= 0)
+				break;
+			pollfd descriptor{child_out, POLLIN, 0};
+			int ready;
+			do
+			{
+				ready = ::poll(&descriptor, 1, remaining);
+			} while (ready < 0 && errno == EINTR);
+			if (ready <= 0 || (descriptor.revents & (POLLERR | POLLNVAL)))
+				break;
+			ssize_t n;
+			do
+			{
+				n = ::read(child_out, buf, sizeof(buf) - 1);
+			} while (n < 0 && errno == EINTR);
 			if (n <= 0)
 			{
 				debugLog("UCI: read() returned <= 0 while waiting for bestmove");
@@ -267,20 +356,10 @@ chess::Move get_best_move_from_stockfish(const chess::Board &board)
 				// debugLog("UCI: breaking read loop after bestmove");
 				break;
 			}
-			auto now = std::chrono::steady_clock::now();
-			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() > 20000)
-			{
-				debugLog("UCI: timeout (20s) while waiting for bestmove");
-				break;
-			}
 		}
 		// debugLog("UCI: exiting bestmove read loop");
 	}
-	uci_write(child_in, "quit");
-	// debugLog("UCI: sent quit to engine");
-	close(child_in);
-	close(child_out);
-	waitpid(pid, nullptr, 0);
+	stopEngine(pid, child_in, child_out);
 	// debugLog("UCI: engine process terminated and pipes closed");
 	if (!bestLine)
 	{
@@ -309,19 +388,14 @@ chess::Move get_best_move_from_stockfish(const chess::Board &board)
 	return *mv;
 }
 
-std::string getSingleCharInput()
+std::optional<std::string> getLineInput()
 {
 	debugLog("Input: waiting for line from std::cin");
 	std::string line;
-	std::getline(std::cin, line);
+	if (!std::getline(std::cin, line))
+		return std::nullopt;
 	debugLog("Input: raw line read = '" + line + "'");
-	if (line.size() >= 2)
-	{
-		std::string result = line.substr(0, 2);
-		debugLog("Input: returning first 2 chars = '" + result + "'");
-		return result;
-	}
-	debugLog("Input: returning full line (short input) = '" + line + "'");
+	if (line.size() > 2) line.resize(2);
 	return line;
 }
 
@@ -364,6 +438,31 @@ int pieceValue(chess::PieceType type)
 	return val;
 }
 
+chess::Piece capturedPiece(const chess::Board &board, const chess::Move &move)
+{
+	if (move.typeOf() == chess::Move::CASTLING) return chess::Piece::NONE;
+	if (move.typeOf() == chess::Move::ENPASSANT)
+	{
+		chess::Square square = board.sideToMove() == chess::Color::WHITE ? move.to() - 8 : move.to() + 8;
+		return board.at(square);
+	}
+	return board.at(move.to());
+}
+
+std::string moveDescription(const chess::Move &move)
+{
+	std::string description = static_cast<std::string>(move.from()) + " -> " + static_cast<std::string>(move.to());
+	if (move.typeOf() == chess::Move::PROMOTION)
+	{
+		description += " = ";
+		if (move.promotionType() == chess::PieceType::QUEEN) description += "Q";
+		else if (move.promotionType() == chess::PieceType::ROOK) description += "R";
+		else if (move.promotionType() == chess::PieceType::BISHOP) description += "B";
+		else if (move.promotionType() == chess::PieceType::KNIGHT) description += "N";
+	}
+	return description;
+}
+
 bool moveCausesCheck(const chess::Board &board, const chess::Move &move)
 {
 	chess::Board temp = board;
@@ -375,17 +474,10 @@ bool moveCausesCheck(const chess::Board &board, const chess::Move &move)
 	return causesCheck;
 }
 
-bool isSafeMove(const chess::Board &board, const chess::Move &move, bool iswhite)
+bool isSafeMove(const chess::Board &board, const chess::Move &move)
 {
 	chess::Board temp = board;
 	temp.makeMove(move);
-	auto colour = iswhite ? chess::Color::BLACK : chess::Color::WHITE;
-	if (temp.inCheck() && board.sideToMove() == colour)
-	{
-		debugLog("isSafeMove: " + static_cast<std::string>(move.from()) +
-				 " -> " + static_cast<std::string>(move.to()) + " is NOT safe (king in check)");
-		return false;
-	}
 	chess::Movelist oppMoves;
 	chess::movegen::legalmoves(oppMoves, temp);
 	for (auto m : oppMoves)
@@ -421,16 +513,7 @@ chess::Move pickMVVLVA(const chess::Movelist &moves, const chess::Board &board)
 	for (auto m : moves)
 	{
 		chess::Piece attacker = board.at(m.from());
-		chess::Piece victim = chess::Piece::NONE;
-		if (m.typeOf() == chess::Move::ENPASSANT)
-		{
-			chess::Square capturedSq = (board.sideToMove() == chess::Color::WHITE) ? m.to() - 8 : m.to() + 8;
-			victim = board.at(capturedSq);
-		}
-		else if (m.typeOf() != chess::Move::CASTLING)
-		{
-			victim = board.at(m.to());
-		}
+		chess::Piece victim = capturedPiece(board, m);
 		if (victim != chess::Piece::NONE && victim.color() != attacker.color())
 		{
 			int score = mvvLvaValue(victim.type(), attacker.type());
@@ -453,9 +536,7 @@ chess::Move pickMVVLVA(const chess::Movelist &moves, const chess::Board &board)
 	}
 	else
 	{
-		debugLog("MVV-LVA found no capture, picking random fallback.");
-		if (!moves.empty())
-			bestMove = moves[rand() % moves.size()];
+		debugLog("MVV-LVA found no capture.");
 	}
 	return bestMove;
 }
@@ -538,7 +619,7 @@ ThreatAnalysis detectThreatAndBlock(const chess::Board &board, const chess::Move
 	{
 		defMoves = moves;
 		defenseforthreat.worst.targetSq = board.kingSq(colour);
-		debugLog("Worst threat: BLACK king is in check at " + static_cast<std::string>(defenseforthreat.worst.targetSq));
+		debugLog("King is in check at " + static_cast<std::string>(defenseforthreat.worst.targetSq));
 		chess::Bitboard atks = chess::attacks::attackers(board, colour2, defenseforthreat.worst.targetSq);
 		if (atks)
 		{
@@ -609,7 +690,7 @@ ThreatAnalysis detectThreatAndBlock(const chess::Board &board, const chess::Move
 		}
 		return defenseforthreat;
 	}
-	debugLog("Could not resolve threat,switching to MVVLVA");
+	debugLog("Could not resolve threat, checking for a capture");
 	defenseforthreat.bestDefense = pickMVVLVA(defMoves, board);
 	for (auto &t : defenseforthreat.threats)
 	{
@@ -644,17 +725,12 @@ bool compareScoredMoves(const ScoredMove &a, const ScoredMove &b)
 	return false;
 }
 
-int penalizeIfExposesKing(const chess::Board &board, const chess::Move &m, bool iswhite)
+int penalizeIfExposesKing(const chess::Board &board, const chess::Move &m)
 {
 	chess::Board after = board;
 	after.makeMove(m);
-	auto colour = iswhite ? chess::Color::WHITE : chess::Color::BLACK;
-	if (after.inCheck() && board.sideToMove() == colour)
-		return 100;
-	chess::Board tmp = after;
-	tmp.makeNullMove();
 	chess::Movelist oppMoves;
-	chess::movegen::legalmoves<chess::movegen::MoveGenType::ALL>(oppMoves, tmp);
+	chess::movegen::legalmoves<chess::movegen::MoveGenType::ALL>(oppMoves, after);
 	int maxThreat = 0;
 	for (const auto &om : oppMoves)
 	{
@@ -664,6 +740,14 @@ int penalizeIfExposesKing(const chess::Board &board, const chess::Move &m, bool 
 			int val = pieceValue(target.type());
 			if (val > maxThreat)
 				maxThreat = val;
+		}
+		else if (om.typeOf() == chess::Move::ENPASSANT)
+		{
+			// The captured pawn is beside the destination square in en passant.
+			const chess::Square capturedSquare(om.to().file(), om.from().rank());
+			chess::Piece epTarget = after.at(capturedSquare);
+			if (epTarget != chess::Piece::NONE && epTarget.color() == board.sideToMove())
+				maxThreat = std::max(maxThreat, pieceValue(epTarget.type()));
 		}
 	}
 	return maxThreat * 2;
@@ -693,7 +777,7 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		std::vector<chess::Move> captures;
 		for (auto m : moves)
 		{
-			auto targetPiece = board.at(m.to());
+			auto targetPiece = capturedPiece(board, m);
 			if (targetPiece != chess::Piece::NONE && targetPiece.type() != chess::PieceType::KING)
 			{
 				captures.push_back(m);
@@ -706,8 +790,8 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		if (!captures.empty())
 		{
 			chess::Move m = captures[rng() % captures.size()];
-			debugLog("Selected capture move: " + static_cast<std::string>(m.from()) + " -> " + static_cast<std::string>(m.to()) +
-					 " (target piece: " + std::to_string(pieceValue(board.at(m.to()).type())) + ")");
+			debugLog("Selected capture move: " + moveDescription(m) +
+					 " (target piece: " + std::to_string(pieceValue(capturedPiece(board, m).type())) + ")");
 			return m;
 		}
 		debugLog("No capture moves found, selecting random move.");
@@ -727,7 +811,7 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		std::vector<chess::Move> captures;
 		for (auto m : moves)
 		{
-			auto targetPiece = board.at(m.to());
+			auto targetPiece = capturedPiece(board, m);
 			if (targetPiece != chess::Piece::NONE && targetPiece.type() != chess::PieceType::KING)
 			{
 				captures.push_back(m);
@@ -740,15 +824,15 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		if (!captures.empty())
 		{
 			chess::Move m = captures[rng() % captures.size()];
-			debugLog("Selected capture move: " + static_cast<std::string>(m.from()) + " -> " + static_cast<std::string>(m.to()) +
-					 " (target piece: " + std::to_string(pieceValue(board.at(m.to()).type())) + ")");
+			debugLog("Selected capture move: " + moveDescription(m) +
+					 " (target piece: " + std::to_string(pieceValue(capturedPiece(board, m).type())) + ")");
 			return m;
 		}
 		debugLog("No capture moves found, checking for safe moves.");
 		std::vector<chess::Move> safeMoves;
 		for (auto m : moves)
 		{
-			if (isSafeMove(board, m, iswhite))
+			if (isSafeMove(board, m))
 				safeMoves.push_back(m);
 		}
 		if (!safeMoves.empty())
@@ -763,17 +847,17 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 	if (difficulty == 3)
 	{
 		debugLog("Difficulty 3: checking for moves that cause check.");
-		std::vector<chess::Move> checks;
+		std::vector<chess::Move> safeChecks;
 		for (auto m : moves)
 		{
-			if (moveCausesCheck(board, m))
+			if (moveCausesCheck(board, m) && isSafeMove(board, m))
 			{
-				checks.push_back(m);
+				safeChecks.push_back(m);
 			}
 		}
-		if (!checks.empty())
+		if (!safeChecks.empty())
 		{
-			chess::Move m = checks[rng() % checks.size()];
+			chess::Move m = safeChecks[rng() % safeChecks.size()];
 			debugLog("Selected checking move: " + static_cast<std::string>(m.from()) + " -> " + static_cast<std::string>(m.to()));
 			return m;
 		}
@@ -804,7 +888,7 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		std::vector<chess::Move> captures;
 		for (auto m : moves)
 		{
-			auto targetPiece = board.at(m.to());
+			auto targetPiece = capturedPiece(board, m);
 			if (targetPiece != chess::Piece::NONE && targetPiece.type() != chess::PieceType::KING)
 			{
 				captures.push_back(m);
@@ -817,13 +901,13 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		if (!captures.empty())
 		{
 			std::sort(captures.begin(), captures.end(), [&](const chess::Move &a, const chess::Move &b)
-					  { return pieceValue(board.at(a.to()).type()) > pieceValue(board.at(b.to()).type()); });
+						  { return pieceValue(capturedPiece(board, a).type()) > pieceValue(capturedPiece(board, b).type()); });
 			for (auto &m : captures)
 			{
 				if (!isBait(board, m, iswhite))
 				{
-					debugLog("Selected high-value capture: " + static_cast<std::string>(m.from()) + " -> " + static_cast<std::string>(m.to()) +
-							 " (capturing value " + std::to_string(pieceValue(board.at(m.to()).type())) + ")");
+					debugLog("Selected high-value capture: " + moveDescription(m) +
+							 " (capturing value " + std::to_string(pieceValue(capturedPiece(board, m).type())) + ")");
 					return m;
 				}
 			}
@@ -833,7 +917,7 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 		std::vector<chess::Move> safeMoves;
 		for (auto m : moves)
 		{
-			if (isSafeMove(board, m, iswhite))
+				if (isSafeMove(board, m))
 				safeMoves.push_back(m);
 		}
 		if (!safeMoves.empty())
@@ -854,25 +938,12 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 			chess::Board after = board;
 			after.makeMove(m);
 			int score = 0;
-			bool safe = isSafeMove(board, m, iswhite);
+			bool safe = isSafeMove(board, m);
 			bool check = moveCausesCheck(board, m);
 			bool promotion = (m.typeOf() == chess::Move::PROMOTION);
-			chess::Piece target = chess::Piece::NONE;
+			chess::Piece target = capturedPiece(board, m);
 			int capturedVal = 0;
 			int attackerVal = pieceValue(board.at(m.from()).type());
-			if (m.typeOf() == chess::Move::ENPASSANT)
-			{
-				chess::Square capturedSq = (board.sideToMove() == chess::Color::WHITE) ? m.to() - 8 : m.to() + 8;
-				target = board.at(capturedSq);
-			}
-			else if (m.typeOf() == chess::Move::CASTLING)
-			{
-				target = chess::Piece::NONE;
-			}
-			else
-			{
-				target = board.at(m.to());
-			}
 			if (target != chess::Piece::NONE)
 			{
 				capturedVal = pieceValue(target.type());
@@ -912,7 +983,7 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 							 ", newScore=" + std::to_string(score));
 				}
 			}
-			int penalty = penalizeIfExposesKing(board, m, iswhite);
+			int penalty = penalizeIfExposesKing(board, m);
 			if (penalty > 0)
 			{
 				score -= penalty;
@@ -947,214 +1018,212 @@ chess::Move getComputerMove(const chess::Board &board, int difficulty, bool iswh
 			debugLog("Chosen move: " + static_cast<std::string>(chosenMove.from()) + " -> " + static_cast<std::string>(chosenMove.to()));
 			return chosenMove;
 		}
-		debugLog("falling back to random move.");
-		return randomMove();
+		debugLog("Stockfish failed to provide a legal move.");
+		return chess::Move(chess::Move::NO_MOVE);
 	}
 	debugLog("Unknown difficulty level, falling back to random move.");
 	return randomMove();
 }
 
+struct TerminalSize
+{
+	int width = 80;
+	int height = 24;
+};
+
+TerminalSize terminalSize()
+{
+	TerminalSize size;
+	if (isatty(STDOUT_FILENO))
+	{
+		winsize ws{};
+		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
+		{
+			if (ws.ws_col > 0) size.width = ws.ws_col;
+			if (ws.ws_row > 0) size.height = ws.ws_row;
+		}
+	}
+	return size;
+}
+
+bool supportsAnsi()
+{
+	const char *term = std::getenv("TERM");
+	return isatty(STDOUT_FILENO) && term && std::string(term) != "dumb";
+}
+
+bool supportsUnicode()
+{
+	const char *term = std::getenv("TERM");
+	if (!term || std::string(term) == "dumb") return false;
+	const char *locale = std::getenv("LC_ALL");
+	if (!locale || !*locale) locale = std::getenv("LC_CTYPE");
+	if (!locale || !*locale) locale = std::getenv("LANG");
+	if (!locale || !*locale) return false;
+	std::string value(locale);
+	return value.find("UTF-8") != std::string::npos || value.find("utf8") != std::string::npos || value.find("UTF8") != std::string::npos;
+}
+
+char asciiPiece(chess::Piece piece)
+{
+	char symbol = '?';
+	if (piece.type() == chess::PieceType::KING) symbol = 'K';
+	else if (piece.type() == chess::PieceType::QUEEN) symbol = 'Q';
+	else if (piece.type() == chess::PieceType::ROOK) symbol = 'R';
+	else if (piece.type() == chess::PieceType::BISHOP) symbol = 'B';
+	else if (piece.type() == chess::PieceType::KNIGHT) symbol = 'N';
+	else if (piece.type() == chess::PieceType::PAWN) symbol = 'P';
+	return piece.color() == chess::Color::WHITE ? symbol : static_cast<char>(std::tolower(symbol));
+}
+
+std::string pieceGlyph(chess::Piece piece, bool unicode)
+{
+	if (!unicode) return std::string(1, asciiPiece(piece));
+	// Reverse Unicode glyphs for contrast on a black terminal background:
+	// hollow white glyphs otherwise show the black background through their interiors.
+	if (piece.color() == chess::Color::WHITE)
+	{
+		if (piece.type() == chess::PieceType::KING) return "♚";
+		if (piece.type() == chess::PieceType::QUEEN) return "♛";
+		if (piece.type() == chess::PieceType::ROOK) return "♜";
+		if (piece.type() == chess::PieceType::BISHOP) return "♝";
+		if (piece.type() == chess::PieceType::KNIGHT) return "♞";
+		if (piece.type() == chess::PieceType::PAWN) return "♟";
+		return "?";
+	}
+	if (piece.type() == chess::PieceType::KING) return "♔";
+	if (piece.type() == chess::PieceType::QUEEN) return "♕";
+	if (piece.type() == chess::PieceType::ROOK) return "♖";
+	if (piece.type() == chess::PieceType::BISHOP) return "♗";
+	if (piece.type() == chess::PieceType::KNIGHT) return "♘";
+	if (piece.type() == chess::PieceType::PAWN) return "♙";
+	return "?";
+}
+
 void printBoard(const chess::Board &board, const chess::Move *lastMove = nullptr, const std::vector<chess::Square> &highlightSquares = {})
 {
-	sleep(1);
-	std::cout << "\033c";
+	if (supportsAnsi()) std::cout << "\033[2J\033[H";
 	debugLog("Printing board" + std::string(lastMove ? " with last move highlight" : ""));
-	const std::string highlightLast = "\033[44m";  // Blue
-	const std::string highlightMove = "\033[42m";  // Green
-	const std::string highlightCheck = "\033[41m"; // Red
-	const std::string reset = "\033[0m";
-
-	std::cout << "\n                     					       A    B    C    D    E    F    G    H\n";
-	std::cout << "                                                            +=========================================+\n";
-
+	TerminalSize size = terminalSize();
+	bool unicode = supportsUnicode() && size.width >= 28;
+	bool compact = size.width < 20;
+	bool shortHeight = size.height < 10;
+	int boardWidth = compact ? 12 : 20;
+	int padding = supportsAnsi() && size.width > boardWidth ? (size.width - boardWidth) / 2 : 0;
+	std::string indent(static_cast<size_t>(padding), ' ');
+	const std::string lastColor = supportsAnsi() ? "\033[44m" : "";
+	const std::string moveColor = supportsAnsi() ? "\033[42m" : "";
+	const std::string checkColor = supportsAnsi() ? "\033[41m" : "";
+	const std::string reset = supportsAnsi() ? "\033[0m" : "";
+	if (!shortHeight) std::cout << "\n" << indent << (compact ? "abcdefgh" : "  a b c d e f g h") << "\n";
 	for (int rank = 7; rank >= 0; --rank)
 	{
-		std::cout << "                                                           " << rank + 1 << "||";
+		std::cout << indent << rank + 1 << ' ';
 		for (int file = 0; file < 8; ++file)
 		{
-			int sqIndex = rank * 8 + file;
-			chess::Square sq(sqIndex);
-			chess::Piece p = board.at(sq);
-			std::string u;
-
-			if (p == chess::Piece::NONE)
-			{
-				if ((rank + file) % 2 == 0)
-					u = " ⬛ ";
-				// u = " □ ";
-				// u = "\033[41m   \033[0m";
-				else
-					u = " ⬜ ";
-				// u = " ■ ";
-				// u = "\033[47m   \033[0m";
-			}
-			else
-			{
-				chess::PieceType pt = p.type();
-				if (p.color() == chess::Color::BLACK)
-				{
-					if (pt == chess::PieceType::KING)
-						u = " ♔  ";
-					else if (pt == chess::PieceType::QUEEN)
-						u = " ♕  ";
-					else if (pt == chess::PieceType::ROOK)
-						u = " ♖  ";
-					else if (pt == chess::PieceType::BISHOP)
-						u = " ♗  ";
-					else if (pt == chess::PieceType::KNIGHT)
-						u = " ♘  ";
-					else if (pt == chess::PieceType::PAWN)
-						u = " ♙  ";
-					else
-						u = " ?  ";
-				}
-				else
-				{
-					if (pt == chess::PieceType::KING)
-						u = " ♚  ";
-					else if (pt == chess::PieceType::QUEEN)
-						u = " ♛  ";
-					else if (pt == chess::PieceType::ROOK)
-						u = " ♜  ";
-					else if (pt == chess::PieceType::BISHOP)
-						u = " ♝  ";
-					else if (pt == chess::PieceType::KNIGHT)
-						u = " ♞  ";
-					else if (pt == chess::PieceType::PAWN)
-						u = " ♟  ";
-					else
-						u = " ? ";
-				}
-			}
+			chess::Square square(rank * 8 + file);
+			chess::Piece piece = board.at(square);
+			std::string symbol = piece == chess::Piece::NONE ? ((rank + file) % 2 == 0 ? "." : ":") : pieceGlyph(piece, unicode);
+			const std::string *color = nullptr;
 			if (lastMove && board.inCheck())
 			{
 				chess::Bitboard attackers = chess::attacks::attackers(board, ~board.sideToMove(), board.kingSq(board.sideToMove()));
-				bool highlight = (sq == board.kingSq(board.sideToMove())) || (attackers & chess::Bitboard::fromSquare(sq));
-				if (highlight)
-				{
-					std::cout << highlightCheck << u << reset << "|";
-				}
-				else
-				{
-					std::cout << u << "|";
-				}
+				if (square == board.kingSq(board.sideToMove()) || (attackers & chess::Bitboard::fromSquare(square))) color = &checkColor;
 			}
-			else if (lastMove && (sq == lastMove->from() || sq == lastMove->to()))
-			{
-				std::cout << highlightLast << u << reset << "|";
-			}
-			else if (std::find(highlightSquares.begin(), highlightSquares.end(), sq) != highlightSquares.end())
-			{
-				std::cout << highlightMove << u << reset << "|";
-			}
-			else
-			{
-				std::cout << u << "|";
-			}
+			else if (lastMove && (square == lastMove->from() || square == lastMove->to())) color = &lastColor;
+			else if (std::find(highlightSquares.begin(), highlightSquares.end(), square) != highlightSquares.end()) color = &moveColor;
+			if (color) std::cout << *color << symbol << reset;
+			else std::cout << symbol;
+			if (!compact && file != 7) std::cout << ' ';
 		}
-		if (rank != 0)
-		{
-			std::cout << "|" << rank + 1 << "\n"
-					  << "                                                            ||---------------------------------------||\n";
-		}
-		else
-		{
-			std::cout << "|" << rank + 1 << "\n";
-		}
+		std::cout << ' ' << rank + 1 << '\n';
 	}
-
-	std::cout << "                                                            +=========================================+";
-	std::cout << "\n                                                               A     B    C    D    E    F    G    H\n";
+	if (!shortHeight) std::cout << indent << (compact ? "abcdefgh" : "  a b c d e f g h") << "\n";
 }
 
 void printHistory(const std::vector<std::string> &history)
 {
 	debugLog("Printing move history, total moves: " + std::to_string(history.size()));
-	std::cout << "\033[s";
-	std::cout << "\033[1;1H";
 	std::cout << "\nMove history:\n";
-	size_t maxHalfMoves = 36;
-	size_t start = (history.size() > maxHalfMoves) ? history.size() - maxHalfMoves : 0;
-	for (size_t i = start; i < history.size(); i++)
+	TerminalSize size = terminalSize();
+	size_t visibleMoveRows = static_cast<size_t>(std::max(1, std::min(36, size.height - 20)));
+	size_t maxHalfMoves = visibleMoveRows * 2;
+	size_t start = history.size() > maxHalfMoves ? history.size() - maxHalfMoves : 0;
+	if (start % 2 != 0) --start;
+	for (size_t i = start; i < history.size(); ++i)
 	{
-		if (i % 2 == 0)
-			std::cout << (i / 2 + 1) << ". ";
-		std::cout << history[i] << " ";
-
-		if (i % 2 == 1)
-			std::cout << "\n";
+		if (i % 2 == 0) std::cout << (i / 2 + 1) << ". ";
+		std::cout << history[i] << (i % 2 == 0 && i + 1 < history.size() ? "  " : "\n");
 	}
-	std::cout << "\n";
-	std::cout << "\033[u";
 	for (size_t i = 0; i < history.size(); i += 2)
 	{
 		std::string line = std::to_string(i / 2 + 1) + ". " + history[i];
-		if (i + 1 < history.size())
-			line += " " + history[i + 1];
+		if (i + 1 < history.size()) line += " " + history[i + 1];
 		debugLog(line);
 	}
 }
 
 void printCaptured(const std::vector<chess::Piece> &capturedPieces)
 {
-	if (capturedPieces.empty())
-		return;
-	std::cout << "\033[s";
-	std::cout << "\033[1;130H";
+	if (capturedPieces.empty()) return;
+	TerminalSize size = terminalSize();
+	bool unicode = supportsUnicode() && size.width >= 28;
 	std::cout << "Captured: ";
-	int count = 0;
-	for (const auto &p : capturedPieces)
+	int column = 9;
+	for (const auto &piece : capturedPieces)
 	{
-		std::string u;
-		chess::PieceType pt = p.type();
-		if (p.color() == chess::Color::BLACK)
+		std::string symbol = pieceGlyph(piece, unicode);
+		int glyphWidth = unicode ? 2 : 1;
+		if (column + glyphWidth + 1 > size.width && column > 9)
 		{
-			if (pt == chess::PieceType::KING)
-				u = " ♔ ";
-			else if (pt == chess::PieceType::QUEEN)
-				u = " ♕ ";
-			else if (pt == chess::PieceType::ROOK)
-				u = " ♖ ";
-			else if (pt == chess::PieceType::BISHOP)
-				u = " ♗ ";
-			else if (pt == chess::PieceType::KNIGHT)
-				u = " ♘ ";
-			else if (pt == chess::PieceType::PAWN)
-				u = " ♙ ";
-			else
-				u = " ? ";
+			std::cout << "\n         ";
+			column = 9;
 		}
-		else
-		{
-			if (pt == chess::PieceType::KING)
-				u = " ♚ ";
-			else if (pt == chess::PieceType::QUEEN)
-				u = " ♛ ";
-			else if (pt == chess::PieceType::ROOK)
-				u = " ♜ ";
-			else if (pt == chess::PieceType::BISHOP)
-				u = " ♝ ";
-			else if (pt == chess::PieceType::KNIGHT)
-				u = " ♞ ";
-			else if (pt == chess::PieceType::PAWN)
-				u = " ♟ ";
-			else
-				u = " ? ";
-		}
-		std::cout << u;
-		count++;
-		if (count % 8 == 0)
-		{
-			int row = (count / 8);
-			std::cout << "\033[" << (row + 1) << ";130H";
-			std::cout << "          ";
-		}
+		std::cout << symbol << ' ';
+		column += glyphWidth + 1;
 	}
-	std::cout << std::endl;
-	std::cout << "\033[u";
+	std::cout << '\n';
 }
 
-int main()
+enum class EndReason { NONE, CHECKMATE, STALEMATE, INSUFFICIENT_MATERIAL, SEVENTY_FIVE_MOVE_RULE, FIVEFOLD_REPETITION };
+
+struct GameStatus
+{
+	EndReason reason = EndReason::NONE;
+	chess::Color winner = chess::Color::NONE;
+};
+
+GameStatus gameStatus(const chess::Board &board)
+{
+	chess::Movelist legal;
+	chess::movegen::legalmoves(legal, board);
+	if (legal.empty())
+		return {board.inCheck() ? EndReason::CHECKMATE : EndReason::STALEMATE,
+				board.inCheck() ? ~board.sideToMove() : chess::Color::NONE};
+	if (board.isInsufficientMaterial()) return {EndReason::INSUFFICIENT_MATERIAL, chess::Color::NONE};
+	// The bundled library exposes the half-move clock and repetition count,
+	// so the app can apply the automatic FIDE thresholds without editing its generated header.
+	if (board.halfMoveClock() >= 150) return {EndReason::SEVENTY_FIVE_MOVE_RULE, chess::Color::NONE};
+	if (board.isRepetition(4)) return {EndReason::FIVEFOLD_REPETITION, chess::Color::NONE};
+	return {};
+}
+
+void printGameStatus(const GameStatus &status)
+{
+	switch (status.reason)
+	{
+	case EndReason::CHECKMATE:
+		std::cout << "\n" << (status.winner == chess::Color::WHITE ? "White" : "Black") << " wins by checkmate!\n";
+		break;
+	case EndReason::STALEMATE: std::cout << "\nGame drawn by stalemate.\n"; break;
+	case EndReason::INSUFFICIENT_MATERIAL: std::cout << "\nGame drawn by insufficient material.\n"; break;
+	case EndReason::SEVENTY_FIVE_MOVE_RULE: std::cout << "\nGame drawn by the 75-move rule.\n"; break;
+	case EndReason::FIVEFOLD_REPETITION: std::cout << "\nGame drawn by fivefold repetition.\n"; break;
+	case EndReason::NONE: break;
+	}
+}
+
+bool runGame()
 {
 	debugLog("=== New Chess Session Started ===", true);
 	chess::Board board;
@@ -1166,14 +1235,15 @@ int main()
 	bool playerIsWhite = true;
 	while (true)
 	{
-		sleep(1);
-		std::cout << "\033c";
+		if (supportsAnsi()) std::cout << "\033[2J\033[H";
 		std::cout << "Choose game mode:\n";
 		std::cout << "1. Player vs Player\n";
 		std::cout << "2. Player vs AI\n";
 		std::cout << "3. AI vs AI\n";
 		std::cout << "Enter choice (1/2/3): ";
-		gameModeInput = getSingleCharInput();
+		auto gameModeLine = getLineInput();
+		if (!gameModeLine) return false;
+		gameModeInput = *gameModeLine;
 		if (gameModeInput.size() == 1 && (gameModeInput == "1" || gameModeInput == "2" || gameModeInput == "3"))
 		{
 			gameMode = std::stoi(gameModeInput);
@@ -1181,7 +1251,7 @@ int main()
 		}
 		else
 		{
-			std::cout << "Invalid choice. Please enter 1 or 2.\n";
+			std::cout << "Invalid choice. Please enter 1, 2, or 3.\n";
 		}
 	}
 	debugLog("Game mode: " + std::to_string(gameMode));
@@ -1189,16 +1259,17 @@ int main()
 	{
 		while (true)
 		{
-			sleep(1);
-			std::cout << "\033c";
-			std::cout << "Choose Difficuly:\n";
+			if (supportsAnsi()) std::cout << "\033[2J\033[H";
+			std::cout << "Choose difficulty:\n";
 			std::cout << "1. Novice\n";
 			std::cout << "2. Strategist\n";
 			std::cout << "3. Master\n";
-			std::cout << "4. Human\n";
-			std::cout << "5. ALIEN\n";
+			std::cout << "4. Human (human-like AI)\n";
+			std::cout << "5. Stockfish\n";
 			std::cout << "Enter choice (1/2/3/4/5): ";
-			DifficultyInput = getSingleCharInput();
+			auto difficultyLine = getLineInput();
+			if (!difficultyLine) return false;
+			DifficultyInput = *difficultyLine;
 			if (DifficultyInput.size() == 1 && (DifficultyInput == "1" || DifficultyInput == "2" || DifficultyInput == "3" || DifficultyInput == "4" || DifficultyInput == "5"))
 			{
 				difficulty = std::stoi(DifficultyInput);
@@ -1212,13 +1283,14 @@ int main()
 		}
 		while (true)
 		{
-			sleep(1);
-			std::cout << "\033c";
+			if (supportsAnsi()) std::cout << "\033[2J\033[H";
 			std::cout << "Choose side:\n";
 			std::cout << "1. Play as White\n";
 			std::cout << "2. Play as Black\n";
 			std::cout << "Enter choice (1/2): ";
-			std::string sideInput = getSingleCharInput();
+			auto sideLine = getLineInput();
+			if (!sideLine) return false;
+			std::string sideInput = *sideLine;
 			if (sideInput.size() == 1 && (sideInput == "1" || sideInput == "2"))
 			{
 				playerIsWhite = (sideInput == "1");
@@ -1235,6 +1307,7 @@ int main()
 	{
 		difficulty = 5;
 	}
+	bool stockfishForfeit = false;
 	std::vector<std::string> moveHistory;
 	std::vector<chess::Piece> moveCaptured;
 	chess::Move lastMove;
@@ -1254,43 +1327,18 @@ int main()
 		}
 		if (gameMode == 1 || gameMode == 2)
 		{
-			auto [reason, result] = board.isGameOver();
+			GameStatus status = gameStatus(board);
 			debugLog("Checking if game is over");
-			if (reason != chess::GameResultReason::NONE)
+			if (status.reason != EndReason::NONE)
 			{
-				debugLog("Game over detected. Reason: " + std::to_string(static_cast<int>(reason)) + ", Result: " + std::to_string(static_cast<int>(result)));
-				if (reason == chess::GameResultReason::CHECKMATE)
-				{
-					std::cout << "\n"
-							  << (board.sideToMove() == chess::Color::WHITE ? "Black" : "White")
-							  << " wins by checkmate!\n";
-				}
-				else if (reason == chess::GameResultReason::STALEMATE)
-				{
-					std::cout << "\n"
-							  << "Game drawn by stalemate.\n";
-				}
-				else if (reason == chess::GameResultReason::INSUFFICIENT_MATERIAL)
-				{
-					std::cout << "\n"
-							  << "Game drawn by insufficient material.\n";
-				}
-				else if (reason == chess::GameResultReason::FIFTY_MOVE_RULE)
-				{
-					std::cout << "\n"
-							  << "Game drawn by 50-move rule.\n";
-				}
-				else if (reason == chess::GameResultReason::THREEFOLD_REPETITION)
-				{
-					std::cout << "\n"
-							  << "Game drawn by threefold repetition.\n";
-				}
+				debugLog("Game over detected with reason " + std::to_string(static_cast<int>(status.reason)));
+				printGameStatus(status);
 				break;
 			}
 			bool aiTurn = (gameMode == 2 && ((board.sideToMove() == chess::Color::WHITE) != playerIsWhite));
 			if (aiTurn)
 			{
-				debugLog("AI is WHITE and it is starting...");
+				debugLog(std::string(board.sideToMove() == chess::Color::WHITE ? "White" : "Black") + " AI is starting...");
 				goto AI_MOVE_TURN;
 			}
 			bool whiteToMove = (board.sideToMove() == chess::Color::WHITE);
@@ -1301,12 +1349,14 @@ int main()
 			{
 				debugLog(std::string(whiteToMove ? "White" : "Black") + " is in check");
 				std::cout << "\n"
-						  << "⚠️  " << (whiteToMove ? "White" : "Black") << " is in CHECK!\n";
+						  << (supportsUnicode() ? "⚠️  " : "") << (whiteToMove ? "White" : "Black") << " is in CHECK!\n";
 			}
-			std::cout << "\nq/Q to resign\nChoose a piece[XY FORMAT]: ";
+			std::cout << "\nq/Q to resign\nChoose a piece [square, e.g. e2]: ";
 			std::string input;
 			std::regex squareRegex("^[a-hA-H][1-8]$");
-			input = getSingleCharInput();
+			auto moveInput = getLineInput();
+			if (!moveInput) return false;
+			input = *moveInput;
 			bool isSquare = std::regex_match(input, squareRegex);
 			bool isQuit = (input == "q" || input == "Q");
 			if (!(isSquare || isQuit))
@@ -1320,7 +1370,8 @@ int main()
 			if (input == "q" || input == "Q")
 			{
 				debugLog(std::string(whiteToMove ? "White" : "Black") + " resigns");
-				std::cout << (whiteToMove ? "White" : "Black") << " resigns.\n";
+				std::cout << (whiteToMove ? "White" : "Black") << " resigns. "
+						  << (whiteToMove ? "Black" : "White") << " wins by resignation.\n";
 				break;
 			}
 			if (input.size() != 2)
@@ -1353,47 +1404,43 @@ int main()
 			printBoard(board, nullptr, highlightSquares);
 			std::cout << "Legal moves from " << input << ":\n";
 			int total = fromMoves.size();
-			int rows = std::min(5, total);
-			int cols = (total + rows - 1) / rows;
+			int columns = std::max(1, (terminalSize().width - 2) / 20);
+			int rows = (total + columns - 1) / columns;
 			for (int r = 0; r < rows; r++)
 			{
-				for (int c = 0; c < cols; c++)
+				for (int c = 0; c < columns; c++)
 				{
-					int idx = c * rows + r;
+					int idx = r * columns + c;
 					if (idx < total)
 					{
-						std::string moveStr = static_cast<std::string>(fromMoves[idx].from()) + " -> " + static_cast<std::string>(fromMoves[idx].to());
-						if (fromMoves[idx].typeOf() == chess::Move::PROMOTION)
-						{
-							moveStr += " = ";
-							if (fromMoves[idx].promotionType() == chess::PieceType::QUEEN)
-								moveStr += "Q";
-							if (fromMoves[idx].promotionType() == chess::PieceType::ROOK)
-								moveStr += "R";
-							if (fromMoves[idx].promotionType() == chess::PieceType::BISHOP)
-								moveStr += "B";
-							if (fromMoves[idx].promotionType() == chess::PieceType::KNIGHT)
-								moveStr += "N";
-						}
-						std::cout << std::setw(13) << std::left << (std::to_string(idx + 1) + ". " + moveStr);
+						std::string moveStr = moveDescription(fromMoves[idx]);
+						std::cout << std::setw(20) << std::left << (std::to_string(idx + 1) + ". " + moveStr);
 					}
 				}
 				std::cout << "\n";
 			}
 			int idx = 0;
-			std::cout << "Enter move number or '0' to reselect:\n";
+			std::cout << "Enter move number or destination square; use the move number for promotions. Enter 0 to reselect:\n";
 			std::string choice;
-			bool move_done = false;
 			while (true)
 			{
-				choice = getSingleCharInput();
+				auto choiceInput = getLineInput();
+				if (!choiceInput) return false;
+				choice = *choiceInput;
 				if (choice.size() > 0)
 				{
 					if (choice != "0")
 					{
-						if (std::all_of(choice.begin(), choice.end(), ::isdigit))
+						if (std::all_of(choice.begin(), choice.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; }))
 						{
-							idx = std::stoi(choice) - 1;
+							int choiceNumber = 0;
+							auto parsed = std::from_chars(choice.data(), choice.data() + choice.size(), choiceNumber);
+							if (parsed.ec != std::errc{} || parsed.ptr != choice.data() + choice.size() || choiceNumber <= 0)
+							{
+								std::cout << "Invalid choice. Try again.\n->";
+								continue;
+							}
+							idx = choiceNumber - 1;
 							if (idx < 0 || idx >= (int)fromMoves.size())
 							{
 								std::cout << "Invalid choice. Try again.\n->";
@@ -1404,22 +1451,25 @@ int main()
 						}
 						else if (std::regex_match(choice, squareRegex))
 						{
-							int move_ind = 0;
-							for (auto itr : fromMoves)
+							std::transform(choice.begin(), choice.end(), choice.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+							std::vector<int> matchingMoves;
+							for (int move_ind = 0; move_ind < static_cast<int>(fromMoves.size()); ++move_ind)
 							{
-								if (static_cast<std::string>(itr.to()) == choice)
-								{
-									debugLog("User selected move index: " + std::to_string(move_ind));
-									idx = move_ind;
-									move_done = true;
-									break;
-								}
-								move_ind++;
+								if (static_cast<std::string>(fromMoves[move_ind].to()) == choice)
+									matchingMoves.push_back(move_ind);
 							}
-							if (move_done)
+							if (matchingMoves.size() > 1)
 							{
+								std::cout << "Choose a numbered move to specify the promotion piece.\n->";
+								continue;
+							}
+							if (!matchingMoves.empty())
+							{
+								idx = matchingMoves.front();
 								break;
 							}
+							std::cout << "That destination is not legal from this piece. Try a listed move.\n->";
+							continue;
 						}
 						else
 						{
@@ -1441,20 +1491,7 @@ int main()
 			}
 			chess::Move move = fromMoves[idx];
 			debugLog("Move chosen: " + static_cast<std::string>(move.from()) + " -> " + static_cast<std::string>(move.to()));
-			chess::Piece captured = chess::Piece::NONE;
-			if (move.typeOf() == chess::Move::CASTLING)
-			{
-				captured = chess::Piece::NONE;
-			}
-			else if (move.typeOf() == chess::Move::ENPASSANT)
-			{
-				chess::Square capturedSq = (board.sideToMove() == chess::Color::WHITE) ? move.to() - 8 : move.to() + 8;
-				captured = board.at(capturedSq);
-			}
-			else if (board.at(move.to()) != chess::Piece::NONE)
-			{
-				captured = board.at(move.to());
-			}
+			chess::Piece captured = capturedPiece(board, move);
 			if (captured != chess::Piece::NONE)
 			{
 				debugLog("Piece Captured: " + static_cast<std::string>(captured));
@@ -1462,44 +1499,19 @@ int main()
 			}
 			board.makeMove(move);
 			debugLog("Move applied to board: " + static_cast<std::string>(move.from()) + " -> " + static_cast<std::string>(move.to()));
-			moveHistory.push_back(static_cast<std::string>(move.from()) + " -> " + static_cast<std::string>(move.to()));
+			moveHistory.push_back(moveDescription(move));
 			lastMove = move;
 			printBoard(board, &lastMove);
 		}
 		AI_MOVE_TURN:
 		if (gameMode == 2 || gameMode == 3)
 		{
-			auto [reason, result] = board.isGameOver();
+			GameStatus status = gameStatus(board);
 			debugLog("Checking if game is over");
-			if (reason != chess::GameResultReason::NONE)
+			if (status.reason != EndReason::NONE)
 			{
-				debugLog("Game over detected. Reason: " + std::to_string(static_cast<int>(reason)) + ", Result: " + std::to_string(static_cast<int>(result)));
-				if (reason == chess::GameResultReason::CHECKMATE)
-				{
-					std::cout << "\n"
-							  << (board.sideToMove() == chess::Color::WHITE ? "Black" : "White")
-							  << " wins by checkmate!\n";
-				}
-				else if (reason == chess::GameResultReason::STALEMATE)
-				{
-					std::cout << "\n"
-							  << "Game drawn by stalemate.\n";
-				}
-				else if (reason == chess::GameResultReason::INSUFFICIENT_MATERIAL)
-				{
-					std::cout << "\n"
-							  << "Game drawn by insufficient material.\n";
-				}
-				else if (reason == chess::GameResultReason::FIFTY_MOVE_RULE)
-				{
-					std::cout << "\n"
-							  << "Game drawn by 50-move rule.\n";
-				}
-				else if (reason == chess::GameResultReason::THREEFOLD_REPETITION)
-				{
-					std::cout << "\n"
-							  << "Game drawn by threefold repetition.\n";
-				}
+				debugLog("Game over detected with reason " + std::to_string(static_cast<int>(status.reason)));
+				printGameStatus(status);
 				break;
 			}
 			debugLog("AI to move");
@@ -1507,29 +1519,32 @@ int main()
 			if (board.inCheck())
 			{
 				debugLog(" AI is in check");
-				std::cout << "\n ⚠️ " << (board.sideToMove() == chess::Color::WHITE ? "White" : "Black") << "-AI is in CHECK!\n";
+				std::cout << "\n" << (supportsUnicode() ? "⚠️ " : "") << (board.sideToMove() == chess::Color::WHITE ? "White" : "Black") << "-AI is in CHECK!\n";
 			}
 			chess::Move computerMove = getComputerMove(board, difficulty, playerIsWhite);
 			if (computerMove == chess::Move::NO_MOVE)
 			{
-				debugLog("Computer produced NO_MOVE (no legal move available).");
-				std::cout << (board.sideToMove() == chess::Color::WHITE ? "White" : "Black") << "-AI resigns as there is no legal move" << std::endl;
+				if (difficulty == 5)
+				{
+					chess::Color forfeitingSide = board.sideToMove();
+					chess::Color winner = ~forfeitingSide;
+					debugLog("Stockfish forfeits because it failed to provide a legal move.");
+					std::cout << "Stockfish (" << (forfeitingSide == chess::Color::WHITE ? "White" : "Black")
+							  << ") forfeits after failing to provide a legal move. "
+							  << (winner == chess::Color::WHITE ? "White" : "Black") << " wins.\n";
+					if (gameMode == 2 && winner == (playerIsWhite ? chess::Color::WHITE : chess::Color::BLACK))
+						std::cout << "You win by forfeit.\n";
+					std::cout << "Press Enter to return to the game menu.\n";
+					stockfishForfeit = true;
+				}
+				else
+				{
+					debugLog("Computer produced NO_MOVE despite a non-terminal position.");
+					std::cout << (board.sideToMove() == chess::Color::WHITE ? "White" : "Black") << " AI cannot move.\n";
+				}
 				break;
 			}
-			chess::Piece captured = chess::Piece::NONE;
-			if (computerMove.typeOf() == chess::Move::CASTLING)
-			{
-				captured = chess::Piece::NONE;
-			}
-			else if (computerMove.typeOf() == chess::Move::ENPASSANT)
-			{
-				chess::Square capturedSq = (board.sideToMove() == chess::Color::WHITE) ? computerMove.to() - 8 : computerMove.to() + 8;
-				captured = board.at(capturedSq);
-			}
-			else if (board.at(computerMove.to()) != chess::Piece::NONE)
-			{
-				captured = board.at(computerMove.to());
-			}
+			chess::Piece captured = capturedPiece(board, computerMove);
 			if (captured != chess::Piece::NONE)
 			{
 				debugLog("Piece Captured: " + static_cast<std::string>(captured));
@@ -1537,11 +1552,11 @@ int main()
 			}
 			board.makeMove(computerMove);
 			debugLog("Computer move applied to board: " + static_cast<std::string>(computerMove.from()) + " -> " + static_cast<std::string>(computerMove.to()));
-			std::cout << "\n"
-					  << (board.sideToMove() == chess::Color::WHITE ? "Black" : "White") << "-AI plays: " << static_cast<std::string>(computerMove.from()) << " -> " << static_cast<std::string>(computerMove.to()) << "\n";
-			moveHistory.push_back(static_cast<std::string>(computerMove.from()) + " -> " + static_cast<std::string>(computerMove.to()));
+			moveHistory.push_back(moveDescription(computerMove));
 			lastMove = computerMove;
 			printBoard(board, &lastMove);
+			std::cout << "\n"
+					  << (board.sideToMove() == chess::Color::WHITE ? "Black" : "White") << "-AI plays: " << moveDescription(computerMove) << "\n";
 		}
 	}
 	if (!moveHistory.empty())
@@ -1550,5 +1565,14 @@ int main()
 		printHistory(moveHistory);
 	}
 	debugLog("Game ended");
+	if (stockfishForfeit && !getLineInput()) return false;
+	return stockfishForfeit;
+}
+
+int main()
+{
+	std::signal(SIGPIPE, SIG_IGN);
+	while (runGame())
+		;
 	return 0;
 }

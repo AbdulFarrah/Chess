@@ -27,8 +27,8 @@ its difficulty levels.
 -   Check and checkmate detection
 -   Stalemate detection
 -   Insufficient-material detection
--   Fifty-move rule detection
--   Threefold-repetition detection
+-   Automatic 75-move rule detection
+-   Automatic fivefold-repetition detection
 -   Castling
 -   En passant
 -   Pawn promotion
@@ -38,6 +38,20 @@ its difficulty levels.
 -   Check highlighting
 -   Legal-destination highlighting when selecting a piece
 -   Debug logging to `chess_debug.log`
+
+## Draw rules
+
+The application automatically ends a game after 75 moves by each side
+without a pawn move or capture (150 half-moves), or when the same position
+has occurred five times. The bundled library exposes the half-move clock
+and repetition count needed for these thresholds, so the app applies them
+without modifying the generated `chess.hpp`.
+
+The game does not offer draw claims at the 50-move or threefold-repetition
+thresholds. The library's general `Board::isGameOver()` convenience method
+uses those earlier thresholds, so the application uses its own game-end
+check instead. Checkmate takes precedence over the automatic 75-move draw.
+Insufficient-material detection uses the bundled library's basic checks.
 
 ## Requirements
 
@@ -69,7 +83,7 @@ A C++17-compatible compiler is required.
 The supplied build script uses:
 
 ``` bash
-g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess.exe
+g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess
 ```
 
 GCC's C++17 support can be checked in the official GCC documentation:
@@ -158,19 +172,19 @@ The build script removes existing `.log` files and compiles the project
 into:
 
 ``` text
-chess.exe
+chess
 ```
 
 Run the game with:
 
 ``` bash
-./chess.exe
+./chess
 ```
 
 You can also build manually:
 
 ``` bash
-g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess.exe
+g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess
 ```
 
 ## Game Modes
@@ -190,12 +204,15 @@ For AI vs AI, the program uses its highest configured difficulty.
 
 ## Difficulty Levels
 
-The program exposes five difficulty levels.
+The program exposes five difficulty levels. Level 4 is labeled **Human**
+to describe the human-like style of its heuristic AI; it is still the
+computer's turn. Level 5 uses Stockfish.
 
 The exact behavior of each level is implemented in `getComputerMove()`
 and the supporting move-evaluation functions in `main.cpp`.
 
-The AI implementation includes techniques such as:
+The first four levels use simple heuristics, not a search engine. They
+include techniques such as:
 
 -   Piece-value evaluation
 -   MVV-LVA capture ordering
@@ -203,8 +220,11 @@ The AI implementation includes techniques such as:
 -   Defensive move selection
 -   Check detection
 -   Safe-move evaluation
--   Random move fallback
--   Stockfish-based move selection
+-   Level 4 reply checks that penalize moves leaving valuable pieces open
+-   Random move selection when the heuristics have no preferred move
+
+The heuristic names describe play styles rather than calibrated chess
+strength. Level 5 uses Stockfish instead of those heuristics.
 
 Stockfish itself is invoked through the UCI protocol with:
 
@@ -258,6 +278,10 @@ e4
 
 also selects that move.
 
+For a promotion, use its numbered entry so you can choose the piece.
+Move history keeps the coordinate notation and appends the promotion
+piece, for example `a7 -> a8 = Q`.
+
 Enter:
 
 ``` text
@@ -282,8 +306,17 @@ to resign.
 
 ## Board Representation
 
-The board is rendered directly in the terminal using Unicode chess
-pieces.
+The interface adapts to the terminal width and height. ANSI terminals get
+screen clearing and move highlighting; simpler terminals get plain text.
+Unicode piece symbols are used when the locale advertises UTF-8 and there
+is enough terminal width; otherwise the board uses ASCII pieces (`K` for
+White and `k` for Black). The layout reads the terminal window size when
+available, uses a compact board in narrow windows, and limits displayed
+move history based on terminal height. On very short screens it omits the
+file labels to keep all eight ranks visible. Unicode glyphs are deliberately
+reversed on dark backgrounds for contrast: White uses filled symbols and
+Black uses hollow symbols. ASCII pieces continue to use uppercase for White
+and lowercase for Black.
 
 The interface also displays:
 
@@ -329,6 +362,11 @@ For an AI move, the program:
 11. Applies the move to the board.
 12. Terminates the Stockfish process.
 
+UCI reads use timeouts, and shutdown escalates from a normal quit to
+termination signals with bounded waits. If Stockfish fails to start, respond,
+or return a legal move, it forfeits and the opponent wins. The game displays
+the result and returns to the game menu after Enter.
+
 The Stockfish executable path is defined in `main.cpp`:
 
 ``` cpp
@@ -347,6 +385,9 @@ The log contains information about game flow, move selection, captures,
 Stockfish communication, and other internal operations.
 
 The supplied `make.sh` removes existing `.log` files before rebuilding.
+If Stockfish cannot start, respond, or provide a legal move, it forfeits;
+the opponent is declared the winner. Press Enter after the result to return
+to the game menu.
 
 ## Project Structure
 
@@ -409,8 +450,8 @@ Build helper script.
 Current build command:
 
 ``` bash
-rm -r ./*.log
-g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess.exe
+rm -f ./*.log
+g++ -std=c++17 -Wall -Wextra -O2 main.cpp -o chess
 ```
 
 ## Important Notes
@@ -433,14 +474,13 @@ https://stockfishchess.org/download/
 
 ### No project-wide license
 
-This repository does not currently declare a project-wide open-source
-license.
+The repository is public and available at no charge to view and download.
+No license is declared for the project-authored files, so public
+availability alone does not grant reuse rights.
 
-The absence of a license means the repository's own code should not be
-assumed to be freely reusable beyond what copyright law permits.
-
-The `chess.hpp` file is different: it contains the license terms of its
-upstream project. Those terms apply to that upstream code.
+The `chess.hpp` file contains the MIT license for Disservin's upstream
+chess-library code. Those terms apply to that upstream code, not to the
+project-authored files.
 
 ## Troubleshooting
 
@@ -486,10 +526,11 @@ then:
 ./make.sh
 ```
 
-### Unicode chess pieces look incorrect
+### Chess symbols look incorrect
 
-The terminal should support UTF-8 and Unicode chess characters. A modern
-Linux terminal emulator is recommended.
+Set a UTF-8 locale to use Unicode chess symbols. Without one, the program
+uses ASCII piece letters. ANSI highlighting is only used when stdout is a
+terminal that does not identify itself as `dumb`.
 
 ## Credits
 
